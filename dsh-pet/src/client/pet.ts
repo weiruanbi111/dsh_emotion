@@ -4,15 +4,7 @@
 // 配置唯一入口 = GET /dsh-pet-7340/config 的**成品聚合**（host readAllConfig 保证绝对正确）：
 // PetMulti 一次拉取 → flattenConfigPets 拍平成渲染列表，PetCard 直接读字段，零校验零兜底。
 // 纯逻辑（选择/移动几何/余额/拍平）来自 src/shared —— 与桌面模式共用同一份源码。
-import {
-  pick,
-  rollKind,
-  pickCategoryAction,
-  pickSlot,
-  isEventAnim,
-  poolIncludes,
-  nextWorkStatusAnim,
-} from '../shared/pickers';
+import { pick, rollKind, pickCategoryAction, pickSlot, isEventAnim, poolIncludes } from '../shared/pickers';
 import { planMove } from '../shared/motion';
 import { flattenConfigPets, isWebVisible } from '../shared/config';
 import { balanceEventIndex, balancePercent, decideBalanceNotice, type BalanceState } from '../shared/balance';
@@ -23,9 +15,12 @@ import {
   postAction,
   readBalance,
   readSay,
+  chooseSayAnimation,
+  continueWorkStatusAnimation,
   readAnim,
   readWorkStatus,
   takeChanged,
+  type SayPayload,
 } from '../shared/state';
 import { WORK_STATUS_INDEX, type WorkStatusSnapshot } from '../shared/work-status';
 import { makeBalanceBubble, makeWhisperBubble } from './bubble';
@@ -161,7 +156,7 @@ export function makePetUI(rt: {
     workStatus: WorkStatusSnapshot | null;
     workStatusTick: number;
     /** 本宠物的「说一句话」（碎碎念/命令气泡/对话回复三合一；容器从 S 分发下来） */
-    say?: { text: string; image?: string; seq: number };
+    say?: SayPayload & { seq: number };
     sayTick: number;
     /** 本宠物的「点播动画」指令（其他插件经 POST /anim 写进 S；容器从 S 分发下来）。
      *  注意与组件内既有的 `anim`（**当前正在播的**动画名）区分：这个只是"要播什么"的指令。 */
@@ -591,7 +586,7 @@ export function makePetUI(rt: {
     useEffect(() => {
       if (!say || say.seq === prevSaySeqRef.current) return;
       prevSaySeqRef.current = say.seq;
-      triggerWhisper(say.text, say.image);
+      triggerWhisper(say.text, say.image, say.emotionAnimation);
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [sayTick]);
 
@@ -608,14 +603,8 @@ export function makePetUI(rt: {
 
     // 碎碎念触发（本宠物）：随机抽 events.whisper 动画 + 弹文本气泡（10s 消失，与动画解耦）
     // image：host 侧随机抽定的配图名称（未开配图/池为空则 undefined）——与文本同一次触发一起来
-    const triggerWhisper = (text: string, image?: string) => {
-      const pool = petAnims.events?.whisper;
-      if (!pool || pool.length === 0) {
-        console.error('[dsh-pet] 配置缺少 animations.events.whisper，无法播放碎碎念动画');
-        return;
-      }
-      // 整池随机抽 1 槽（避开当前正播动画，避免连续重复）；槽位若为数组候选再档内随机
-      const name = pickSlot(pick(pool, animRef.current), animRef.current);
+    const triggerWhisper = (text: string, image?: string, emotionAnimation?: string | null) => {
+      const name = chooseSayAnimation(petAnims, emotionAnimation, animRef.current);
       console.log(
         '[dsh-pet] ' +
           new Date().toTimeString().slice(0, 8) +
@@ -627,13 +616,15 @@ export function makePetUI(rt: {
           text +
           '」',
       );
-      stopMove();
       setWhisperText(text);
       setWhisperImage(image);
       setWhisperBubbleOn(true);
       // 气泡 10s 定时消失（与动画解耦；重复触发先清旧定时器）
       if (whisperBubbleTimerRef.current !== null) window.clearTimeout(whisperBubbleTimerRef.current);
       whisperBubbleTimerRef.current = window.setTimeout(() => setWhisperBubbleOn(false), BUBBLE_DURATION_MS);
+      if (!name) return; // 无对应素材：气泡照常出现，不打断当前动画/移动。
+      if (isNoMirrorAnimation(petAnims.categories, name) && facingRef.current === 'right') setFacing('left');
+      stopMove();
       setOnce(true);
       setAnim(name);
     };
@@ -731,39 +722,16 @@ export function makePetUI(rt: {
       // 禁止“播完回 idle”——一旦意外触发 ended（loop 被某种原因掐断/once 被误置 true），
       // 立即重设循环续播，直到状态真正切走（success/error/空闲）。其余事件动画仍按原语义回 idle。
       const wsNow = workStatusRef.current;
-      if (isEvent && wsNow && wsNow.state && wsNow.state !== 'success' && wsNow.state !== 'error') {
-        // 多候选档位：播完一段自动轮换到下一候选（排除当前段，避免连抽）——长时间状态不单段重复
-        const nextWork = nextWorkStatusAnim(animations.events?.workStatus ?? [], animRef.current);
-        if (nextWork !== null) {
-          console.log(
-            '[dsh-pet] ' +
-              new Date().toTimeString().slice(0, 8) +
-              ' pet=' +
-              cfg.id +
-              ' workStatus 档内轮换: ' +
-              animRef.current +
-              ' -> ' +
-              nextWork,
-          );
-          setOnce(true); // 保持 once=true：下一段播完再 ended → 再轮换
-          setAnim(nextWork);
-          setSeq((s) => s + 1);
-          return;
-        }
-        // 单候选/单动画档位（意外 ended：loop 被掐断/once 误置 true）：原护栏语义续播同一段
-        if (poolIncludes(animations.events?.workStatus ?? [], animRef.current)) {
-          console.log(
-            '[dsh-pet] ' +
-              new Date().toTimeString().slice(0, 8) +
-              ' pet=' +
-              cfg.id +
-              ' workStatus 循环续播: ' +
-              animRef.current,
-          );
-          setOnce(false);
-          setSeq((s) => s + 1);
-          return;
-        }
+      const continuation = continueWorkStatusAnimation(
+        animations.events?.workStatus ?? [],
+        wsNow?.state,
+        animRef.current,
+      );
+      if (continuation) {
+        setOnce(continuation.once);
+        setAnim(continuation.name);
+        setSeq((s) => s + 1);
+        return;
       }
       if (isEvent) {
         // 诊断：事件动画 ended 落地（余额/碎碎念/终态 workStatus 走到这里；非终态走上面护栏续播）
@@ -798,6 +766,8 @@ export function makePetUI(rt: {
         setSeq((s) => s + 1);
         return;
       }
+      // 平静回复可能借用 idle/普通动作；结束后也须恢复真实工作档位。
+      if (resumeWorkStatusAnim()) return;
       pickNext();
     };
 
@@ -1668,7 +1638,7 @@ export function makePetUI(rt: {
     // 为什么不再按"有没有启用某功能"决定要不要轮询：说话（命令触发）与宠物开关无关，
     // 今天每只宠物的 /broadcast 轮询本来就不受开关门控——统一后至少不比现在多。
     const [sayTick, setSayTick] = useState(0);
-    const sayRef = useRef<Record<string, { text: string; image?: string; seq: number }>>({});
+    const sayRef = useRef<Record<string, SayPayload & { seq: number }>>({});
     const [animCueTick, setAnimCueTick] = useState(0);
     const animCueRef = useRef<Record<string, { name: string; seq: number }>>({});
     useEffect(() => {

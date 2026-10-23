@@ -14,6 +14,7 @@
 import { PET_DISPLAYS } from '../shared/config';
 import { DEFAULT_PHYSICS } from '../shared/physics';
 import { NOTIFY_ICONS, reloadNotifications, requestNotificationPermission } from './notify';
+import { emotionDiagnosticsEn, emotionDiagnosticsZh, makeEmotionDiagnosticsSection } from './emotion-diagnostics';
 import type { Corner, ModelSelection, Pet, PetDisplay, PhysicsParams } from '../shared/types';
 import type { ChangeEvent, Dispatch, FunctionComponent, SetStateAction } from 'react';
 import type * as ReactNS from 'react';
@@ -183,6 +184,7 @@ type ModelRow =
   | { kind: 'model'; key: string; provider: string; model: { id: string; name: string } };
 
 export const zh = {
+  ...emotionDiagnosticsZh,
   nav: '桌宠配置',
   intro: '管理多个桌宠：每个宠物可独立设置大小与位置（保存后即时生效）。',
   // 卡片标题 + 卡片级说明（说明都进问号，不再占一行小字）
@@ -190,6 +192,12 @@ export const zh = {
   petCardHint:
     '每只宠物独立配置：名字 / 大小 / 显示位置 / 位置 / 偏移 / 四个功能开关。改完点最下面的「保存」即时生效。',
   globalTitle: '全局开关',
+  emotionToggle: '连续情绪',
+  emotionToggleHint: '让可观测事件影响宠物语气和已有动画，情绪会逐渐回归基线。关闭后保留基本功能。只认全局 main 配置。',
+  doNotDisturbToggle: '勿扰',
+  doNotDisturbToggleHint: '暂停主动碎碎念与情绪主动互动；你仍可主动发起对话。只认全局 main 配置。',
+  resetEmotion: '重置全部宠物情绪',
+  resetEmotionDone: '全部宠物情绪已重置。',
   globalHint:
     '所有宠物共用（pet pack 可在自己种类文件里单独覆盖）。这几个开关只改本地状态，随「保存」整包写入用户配置（不做即时写入）；系统通知在保存后即时重读，无需刷新页面。',
   cornerHint: '宠物贴着屏幕的哪个角（桌面端按各自显示器的工作区算）。',
@@ -335,6 +343,7 @@ export const zh = {
 };
 
 export const en = {
+  ...emotionDiagnosticsEn,
   nav: 'Pet Config',
   intro: 'Manage multiple pets: each pet has its own size and position (applies instantly after saving).',
   // Card titles + card-level help (all hints move into the "?" bubble)
@@ -342,6 +351,14 @@ export const en = {
   petCardHint:
     'Per-pet settings: name / size / display / corner / offsets / the four feature switches. Click "Save" at the bottom to apply instantly.',
   globalTitle: 'Global switches',
+  emotionToggle: 'Continuous emotions',
+  emotionToggleHint:
+    'Observed events affect tone and existing animations; emotions gradually return to baseline. Basic features remain available when disabled. Uses the global main setting.',
+  doNotDisturbToggle: 'Do not disturb',
+  doNotDisturbToggleHint:
+    'Pause automatic whispers and proactive emotional interactions. You can still start a chat. Uses the global main setting.',
+  resetEmotion: 'Reset all pet emotions',
+  resetEmotionDone: 'All pet emotions reset.',
   globalHint:
     'Shared by every pet (a pet pack may override them in its own kind file). These switches only change local state and are written to the user config on "Save" (never written immediately); system notifications re-read right after saving, no page refresh needed.',
   cornerHint: 'Which screen corner the pet sticks to (per-monitor work area in desktop mode).',
@@ -530,6 +547,7 @@ export function makePetConfigSection(rt: {
   t: (key: string) => string;
 }): FunctionComponent<{ close?: () => void }> {
   const { h, useState, useEffect, useRef, useCallback, t } = rt;
+  const EmotionDiagnostics = makeEmotionDiagnosticsSection({ h, useState, useEffect, t });
 
   // 设置页样式（只有模型选择器用得上：hover/焦点环/箭头旋转这些伪类行内样式表达不了）
   injectSettingsCss();
@@ -942,6 +960,8 @@ export function makePetConfigSection(rt: {
     // 拖拽落点清空、宠物跳回配置角落），于是"改个通知开关，桌面被重置"，与其它开关行为不一致。
     // 引擎重读放在 save() 成功之后（reloadNotifications）：保存后即时生效，无需刷新页面。
     const [notifyEnabled, setNotifyEnabled] = useState(true);
+    const [emotionEnabled, setEmotionEnabled] = useState(true);
+    const [doNotDisturb, setDoNotDisturb] = useState(false);
     // 表情包配图开关（全局：写用户级配置；与「保存」一起提交，不做即时写入）
     const [whisperImage, setWhisperImage] = useState(false);
     const [chatImage, setChatImage] = useState(false);
@@ -977,6 +997,8 @@ export function makePetConfigSection(rt: {
       setPets(loadedPets.map((p) => ({ ...p, position: { ...p.position } })));
       setSelId((id) => (loadedPets.some((p) => p.id === id) ? id : (loadedPets[0]?.id ?? '')));
       if (typeof m.notificationsEnabled === 'boolean') setNotifyEnabled(m.notificationsEnabled);
+      setEmotionEnabled(m.emotionEnabled !== false);
+      setDoNotDisturb(m.doNotDisturb === true);
       if (typeof m.whisperImageEnabled === 'boolean') setWhisperImage(m.whisperImageEnabled);
       if (typeof m.chatImageEnabled === 'boolean') setChatImage(m.chatImageEnabled);
       if (typeof m.confineToScreen === 'boolean') setConfineScreen(m.confineToScreen);
@@ -1154,6 +1176,8 @@ export function makePetConfigSection(rt: {
         const body: Record<string, unknown> = {
           pets: pets,
           notificationsEnabled: notifyEnabled,
+          emotionEnabled,
+          doNotDisturb,
           whisperImageEnabled: whisperImage,
           chatImageEnabled: chatImage,
           confineToScreen: confineScreen,
@@ -1198,6 +1222,19 @@ export function makePetConfigSection(rt: {
     };
 
     const sync = () => setDialog({ kind: 'sync' });
+    const resetEmotion = async () => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const response = await fetch('/dsh-pet-7340/emotion/reset', { method: 'POST' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        setMsg({ kind: 'ok', text: t('resetEmotionDone') });
+      } catch {
+        setMsg({ kind: 'err', text: t('loadError') });
+      } finally {
+        setBusy(false);
+      }
+    };
 
     const doSync = async () => {
       setBusy(true);
@@ -1515,6 +1552,8 @@ export function makePetConfigSection(rt: {
               className: 'dsh-pet-cfg__grid4',
               children: [
                 toggleCell('notifyToggle', notifyEnabled, busy, (v) => void toggleNotify(v)),
+                toggleCell('emotionToggle', emotionEnabled, busy, setEmotionEnabled),
+                toggleCell('doNotDisturbToggle', doNotDisturb, busy, setDoNotDisturb),
                 toggleCell('whisperImageToggle', whisperImage, busy, setWhisperImage),
                 toggleCell('chatImageToggle', chatImage, busy, setChatImage),
                 toggleCell('confineToggle', confineScreen, busy, setConfineScreen, true),
@@ -1522,6 +1561,8 @@ export function makePetConfigSection(rt: {
             }),
           ],
         }),
+
+        h(EmotionDiagnostics, { petId: selId }),
 
         // AI 模型与对话上下文卡（需求 5）：碎碎念 / 对话各自的服务商 + 模型，条目级——与四个开关
         // 同一套语义，只改本地状态、随「保存」整包写入。host 侧生成时优先用它，失败自动回落。
@@ -1612,6 +1653,13 @@ export function makePetConfigSection(rt: {
               onClick: () => void testNotification(),
               className: 'dsh-pet-cfg__btn',
               children: t('notifyTest'),
+            }),
+            h('button', {
+              type: 'button',
+              disabled: busy,
+              onClick: () => void resetEmotion(),
+              className: 'dsh-pet-cfg__btn',
+              children: t('resetEmotion'),
             }),
             q(t('syncHint')),
             // 两个反馈各归各的：msg = 保存/同步结果，permMsg = 测试通知结果

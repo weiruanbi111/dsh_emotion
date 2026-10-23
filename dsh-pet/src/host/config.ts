@@ -317,6 +317,8 @@ function topFieldValid(key: string, value: unknown): boolean {
       return Number.isFinite(n) && n >= 0;
     }
     case 'notificationsEnabled':
+    case 'emotionEnabled':
+    case 'doNotDisturb':
       return typeof value === 'boolean';
     case 'whisperImageEnabled':
       return typeof value === 'boolean';
@@ -573,7 +575,7 @@ export function findPetInstance(
 
 /**
  * 保存用户层（PUT /config）：更新 main-config.jsonc，接受可编辑字段（pets + 全局开关：
- * notificationsEnabled / whisperImageEnabled / chatImageEnabled / confineToScreen + physics
+ * notificationsEnabled / emotionEnabled / doNotDisturb / whisperImageEnabled / chatImageEnabled / confineToScreen + physics
  * + whisperModel / chatModel + chatMemoryRounds + chatImageLimit）。
  * 编辑语义：**非白名单顶层字段（whisperPrompt / eventsRefreshSec / memes 等）从
  * `existing`（当前磁盘上的用户文件原对象）原样透传保留**——
@@ -635,6 +637,10 @@ export function saveUserConfig(
   }
   const ne = o.notificationsEnabled;
   if (ne !== undefined && typeof ne !== 'boolean') return null;
+  const ee = o.emotionEnabled;
+  if (ee !== undefined && typeof ee !== 'boolean') return null;
+  const dnd = o.doNotDisturb;
+  if (dnd !== undefined && typeof dnd !== 'boolean') return null;
   const wie = o.whisperImageEnabled;
   if (wie !== undefined && typeof wie !== 'boolean') return null;
   const cie = o.chatImageEnabled;
@@ -670,6 +676,8 @@ export function saveUserConfig(
   // 对话历史条数）同样只在请求体**真的传了**时才写（未传则走下面的透传保留，不凭空造值）
   const outConfig: { pets: unknown[]; [key: string]: unknown } = { pets: out };
   if (ne !== undefined) outConfig.notificationsEnabled = ne;
+  if (ee !== undefined) outConfig.emotionEnabled = ee;
+  if (dnd !== undefined) outConfig.doNotDisturb = dnd;
   if (wie !== undefined) outConfig.whisperImageEnabled = wie;
   if (cie !== undefined) outConfig.chatImageEnabled = cie;
   if (cts !== undefined) outConfig.confineToScreen = cts;
@@ -685,6 +693,8 @@ export function saveUserConfig(
   // 否则整包调用的调用方漏传一个字段，就会把用户既有设置悄悄抹成默认。
   const bodyOwned = new Set(['pets']);
   if (ne !== undefined) bodyOwned.add('notificationsEnabled');
+  if (ee !== undefined) bodyOwned.add('emotionEnabled');
+  if (dnd !== undefined) bodyOwned.add('doNotDisturb');
   if (wie !== undefined) bodyOwned.add('whisperImageEnabled');
   if (cie !== undefined) bodyOwned.add('chatImageEnabled');
   if (cts !== undefined) bodyOwned.add('confineToScreen');

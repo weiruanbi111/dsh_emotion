@@ -68,6 +68,8 @@ const BASE = {
   whisperPrompt: '你是桌面宠物',
   chatMemoryRounds: 4,
   notificationsEnabled: true,
+  emotionEnabled: true,
+  doNotDisturb: false,
   eventsRefreshSec: { balance: 1800, whisper: 300 },
   workStatusTexts: [['在干活']],
 };
@@ -340,6 +342,51 @@ describe('readUserConfig —— 用户层读取必须容忍 JSONC 注释（保�
 });
 
 const PETS = BASE.pets;
+
+describe('emotion settings persist without losing existing configuration', () => {
+  test('explicit booleans override disk values, while omitted flags and advanced fields survive', () => {
+    const existing = { pets: PETS, emotionEnabled: true, doNotDisturb: false, whisperPrompt: '原有人设' };
+    const out = saveOnce({ pets: PETS, emotionEnabled: false, doNotDisturb: true }, existing);
+    assert.equal(out?.emotionEnabled, false);
+    assert.equal(out?.doNotDisturb, true);
+    assert.equal(out?.whisperPrompt, existing.whisperPrompt);
+    const retained = saveOnce({ pets: PETS }, out ?? {});
+    assert.equal(retained?.emotionEnabled, false);
+    assert.equal(retained?.doNotDisturb, true);
+  });
+
+  test('non-boolean flags are rejected on save and fall back to defaults on read', () => {
+    for (const key of ['emotionEnabled', 'doNotDisturb']) {
+      for (const value of ['true', 1, null, {}, []]) {
+        assert.equal(saveOnce({ pets: PETS, [key]: value }), null);
+        const paths = withBase({}, { [key]: value });
+        try {
+          const merged = readAllConfig(paths);
+          assert.equal(merged.main[key], BASE[key as 'emotionEnabled' | 'doNotDisturb']);
+        } finally {
+          rmSync(dirname(paths.defaultFile), { recursive: true, force: true });
+        }
+      }
+    }
+  });
+
+  test('default flags and saved flags round trip through the production merge pipeline', () => {
+    const paths = withBase({});
+    try {
+      assert.equal(readAllConfig(paths).main.emotionEnabled, true);
+      assert.equal(readAllConfig(paths).main.doNotDisturb, false);
+      writeFileSync(
+        paths.userFile,
+        JSON.stringify(saveOnce({ pets: PETS, emotionEnabled: false, doNotDisturb: true })),
+      );
+      const merged = readAllConfig(paths);
+      assert.equal(merged.main.emotionEnabled, false);
+      assert.equal(merged.main.doNotDisturb, true);
+    } finally {
+      rmSync(dirname(paths.defaultFile), { recursive: true, force: true });
+    }
+  });
+});
 
 describe('saveUserConfig —— 表情包配图开关（白名单 + 透传保留）', () => {
   test('两个配图开关随请求体写入', () => {

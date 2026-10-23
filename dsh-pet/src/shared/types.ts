@@ -159,6 +159,10 @@ export interface PhysicsParams {
 
 /** config.jsonc 全集——运行时直接使用（ANIM 即本类型） */
 export interface ClientConfig {
+  /** 情绪连续性总开关（只认 main）；关闭后保留基本功能。 */
+  emotionEnabled: boolean;
+  /** 勿扰总开关（只认 main）；暂停主动互动，不阻止用户发起对话。 */
+  doNotDisturb: boolean;
   /** 系统通知总开关：true=对话完成/生成失败/输出截断/权限申请/用户选择时弹出系统通知；缺失即配置错误 */
   notificationsEnabled: boolean;
   /** 碎碎念配图开关：true=碎碎念每次从表情包池随机抽 1 张连同文本显示（碎碎念无上下文，故随机） */

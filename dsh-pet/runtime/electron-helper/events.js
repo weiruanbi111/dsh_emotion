@@ -127,14 +127,8 @@ PetSprite.prototype.showBalanceNotice = function showBalanceNotice(state) {
 
 // 碎碎念展示（本宠物）：随机抽 events.whisper 动画 + 弹文本气泡（10s 消失，与余额同一语义）
 // image：host 随机抽定的配图名称（未开配图/池为空则空串，与浏览器端同一契约）
-PetSprite.prototype.showWhisper = function showWhisper(text, image) {
-  const pool = this.animations.events?.whisper;
-  if (!pool || pool.length === 0) {
-    console.error('[dsh-pet] 配置缺少 animations.events.whisper，无法播放碎碎念动画');
-    return;
-  }
-  // 整池随机抽 1 槽（避开当前正播动画，避免连续重复）；槽位若为数组候选再档内随机（与浏览器一致）
-  const name = S.pickSlot(S.pick(pool, this.anim), this.anim);
+PetSprite.prototype.showWhisper = function showWhisper(text, image, emotionAnimation) {
+  const name = S.chooseSayAnimation(this.animations, emotionAnimation, this.anim);
   console.log(
     '[dsh-pet] ' +
       new Date().toTimeString().slice(0, 8) +
@@ -147,7 +141,6 @@ PetSprite.prototype.showWhisper = function showWhisper(text, image) {
       '」' +
       (image ? ' [' + image + ']' : ''),
   );
-  this.stopMove();
   this.whisperOn = true;
   this.whisperView = S.whisperBubbleView({ ok: true, text, ts: 0 });
   this.whisperImage = typeof image === 'string' ? image : '';
@@ -158,7 +151,7 @@ PetSprite.prototype.showWhisper = function showWhisper(text, image) {
     this.whisperOn = false;
     this.renderBubble();
   }, BUBBLE_DURATION_MS);
-  this.playOnce(name);
+  if (name) this.playSayAnimation(name);
 };
 
 // 余额展示（档位动画 + 气泡）：周期轮询与菜单点播共用同一展示路径，视觉/行为严格一致
@@ -233,7 +226,7 @@ function applySayLeaf(petId, leaf) {
   const said = S.readSay(leaf);
   if (!said) return;
   for (const s of sprites) {
-    if (s.pet.id === petId) s.showWhisper(said.text, said.image);
+    if (s.pet.id === petId) s.showWhisper(said.text, said.image, said.emotionAnimation);
   }
 }
 

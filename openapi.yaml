@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: dsh-pet HTTP API
-  version: 0.3.6
+  version: 0.3.7
   summary: DSH 桌宠插件的宿主 HTTP 接口
   description: |
     dsh-pet 的宿主（host）半侧通过 DSH 的 `webServer` 服务注册**一条前缀路由** `/dsh-pet-7340`，
@@ -38,8 +38,9 @@ info:
 
     这是本 API 最重要的一条约定，理解了它其余都是细节：
 
-    1. **数据只有一个出口**：`GET /state`。它返回宿主内存里的一份"已发布状态" S，
+    1. **播放数据统一从 `GET /state` 读取**。它返回宿主内存里的一份"已发布状态" S，
        里面是若干 **叶子（leaf）**，每个叶子形如 `{ counter, data }`。
+       独立的 `GET /emotion?pet=<id>` 只用于检查某只宠物当前的模拟情绪，不触发模型调用或播放。
     2. **动作端点不返回数据**：`POST /balance`、`POST /whisper`、`POST /broadcast`、`POST /anim`、
        `POST /chat` 只回 `{ ok: true }`，
        表示"这次动作做完了"。它们在宿主内部把结果**写进 S**，调用方随后拉一拍 `/state` 就能看到。
@@ -78,6 +79,8 @@ tags:
     description: 动作端点——触发一次宿主行为，写进 State，只回 `{ ok }`
   - name: Config
     description: 配置的读取、保存与元信息
+  - name: Emotion
+    description: 检查与重置宠物的连续模拟情绪
   - name: Assets
     description: 字体、通知图标、表情包、动画素材
 
@@ -454,6 +457,99 @@ paths:
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
 
+  /dsh-pet-7340/emotion:
+    get:
+      tags: [Emotion]
+      operationId: getEmotion
+      summary: 检查指定宠物的模拟情绪
+      description: |
+        返回连续情绪的当前快照，读取时按经过的时间回归基线，不调用模型。
+        这是宠物自身的模拟状态，不是对用户情绪或用户状态的推测。
+        `pet` 必须是配置中真实存在的宠物 id；省略、空值或未知 id 均返回 HTTP 400。
+        `enabled` 与 `doNotDisturb` 来自全局 `main` 配置；关闭情绪功能仍可检查已保存的快照。
+        MVP 1.1 可选 diagnostics=1 返回本进程有界元数据；须 loopback socket、本机 Host、
+        同源 Origin/Referer、Sec-Fetch-Site: same-origin 及 X-Dsh-Pet-Diagnostics: 1。
+        原生 dsh-app 代理须 Origin 与 Sec-Fetch-Site 均缺失、Referer 缺失或精确为 dsh-app://app/，
+        并继续满足 loopback、本机 Host、自定义头要求；不得带凭据、端口、查询或片段。
+        原生分支还须通过宿主现有 connection 会话与有效 Peer 验证，缺少服务或校验抛错时拒绝。
+        不新增令牌，不读取或输出 Cookie；非空 Origin、Fetch Metadata 或冲突 Referer 不能走该分支。
+        这是本机来源保护，不是身份认证。不满足返回 403；普通查询兼容行为不变。
+      parameters:
+        - $ref: "#/components/parameters/PetIdQuery"
+        - name: diagnostics
+          in: query
+          required: false
+          description: 置 1 请求受保护的本机诊断元数据；不调用模型，不记录聊天/提示词/密钥。
+          schema:
+            type: string
+            enum: ["1"]
+      responses:
+        "200":
+          description: 当前情绪及全局功能开关
+          headers:
+            Cache-Control:
+              description: 恒为 `no-store`
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmotionResponse"
+        "400":
+          description: pet 缺失、为空或不是已有宠物
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnknownEmotionPet"
+        "403":
+          description: 诊断详情请求不是受允许的本机同源来源
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, reason]
+                properties:
+                  ok:
+                    const: false
+                  reason:
+                    const: local-diagnostics-only
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /dsh-pet-7340/emotion/reset:
+    post:
+      tags: [Emotion]
+      operationId: resetEmotion
+      summary: 将指定宠物或全部宠物的情绪重置到基线
+      description: |
+        `pet` 省略时重置全部宠物，提供时只重置指定的已有宠物。
+        重置效价、活跃度及事件去重历史，保留人工互动与自动互动的冷却时间，防止重置绕过冷却。
+        不清除 `memory.json` 聊天记忆，不改用户配置，也不调用模型。
+      parameters:
+        - name: pet
+          in: query
+          required: false
+          description: 目标已有宠物 id；省略 = 全部，空值或未知 id = HTTP 400。
+          schema:
+            type: string
+          example: main
+      responses:
+        "200":
+          description: 情绪重置已完成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          description: pet 为空或不是已有宠物
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnknownEmotionPet"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
   /dsh-pet-7340/config:
     get:
       tags: [Config]
@@ -500,7 +596,7 @@ paths:
 
         - **只白名单字段会被保留**：`pets[]` 的 `id`/`name`/`size`/`balanceEnabled`/
           `whisperEnabled`/`workStatusEnabled`/`fixedEnabled`/`display`/`position`，以及顶层
-          `notificationsEnabled`/`whisperImageEnabled`/`chatImageEnabled`/`confineToScreen`/
+          `notificationsEnabled`/`emotionEnabled`/`doNotDisturb`/`whisperImageEnabled`/`chatImageEnabled`/`confineToScreen`/
           `physics`/`whisperModel`/`chatModel`/`chatMemoryRounds`/`chatImageLimit`。
           其余字段会沿用磁盘上用户文件里的原值（透传保留），所以设置页保存
           **不会抹掉**你手写的精调配置（`whisperPrompt`/`memes`/`eventsRefreshSec` 等）。
@@ -888,6 +984,122 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
 
   schemas:
+    EmotionResponse:
+      type: object
+      required: [ok, enabled, doNotDisturb, state]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        enabled:
+          type: boolean
+          description: main.emotionEnabled，默认 true
+        doNotDisturb:
+          type: boolean
+          description: main.doNotDisturb，默认 false
+        state:
+          $ref: "#/components/schemas/EmotionSnapshot"
+        build:
+          type: object
+          required: [id, version]
+          properties:
+            id:
+              type: string
+            version:
+              type: string
+        diagnostics:
+          type: object
+          description: 仅 diagnostics=1 且来源保护通过时返回。内存记录，重启清空。
+          required: [capacity, lifetime, records]
+          properties:
+            capacity:
+              const: 80
+            lifetime:
+              const: process
+            records:
+              type: array
+              maxItems: 80
+              items:
+                $ref: "#/components/schemas/EmotionDiagnosticRecord"
+
+    EmotionDiagnosticRecord:
+      type: object
+      additionalProperties: false
+      required: [seq, ts, category, event, accepted, reason]
+      properties:
+        seq:
+          type: integer
+        ts:
+          type: number
+        category:
+          enum: [event, expression, proactive, lifecycle]
+        event:
+          type: string
+          description: 固定事件枚举，不含用户原文或会话标识
+        accepted:
+          type: boolean
+        reason:
+          type: string
+          description: 固定原因枚举，不含错误正文
+        before:
+          $ref: "#/components/schemas/EmotionDiagnosticState"
+        after:
+          $ref: "#/components/schemas/EmotionDiagnosticState"
+        strategy:
+          enum: [neutral-chat, warm-chat, supportive-chat, technical, quiet-companion, disabled]
+        animation:
+          type: [string, "null"]
+          maxLength: 120
+
+    EmotionDiagnosticState:
+      type: object
+      additionalProperties: false
+      required: [valence, arousal, label]
+      properties:
+        valence:
+          type: number
+          minimum: -1
+          maximum: 1
+        arousal:
+          type: number
+          minimum: 0
+          maximum: 1
+        label:
+          enum: [calm, cheerful, subdued]
+
+    EmotionSnapshot:
+      type: object
+      required: [valence, arousal, updatedAt, label]
+      properties:
+        valence:
+          type: number
+          minimum: -1
+          maximum: 1
+          description: 情绪效价；基线为 0
+        arousal:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 活跃度；基线为 0.35
+        updatedAt:
+          type: number
+          minimum: 0
+          description: 当前快照计算时间，Unix 毫秒
+        label:
+          type: string
+          enum: [calm, cheerful, subdued]
+
+    UnknownEmotionPet:
+      type: object
+      required: [ok, reason]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        reason:
+          type: string
+          const: unknown-pet
+
     OkResponse:
       type: object
       required: [ok]
@@ -910,7 +1122,15 @@ components:
             失败原因分类。`bad-request` 参数不合法（空文本/超长）、`provider-missing` 没有可用
             的对话服务商、`generate-error` 生成或 IO 失败、`unknown-pet` 指定的桌宠不存在、
             `unknown-image` 配图不在包内表情包池内。
-          enum: [bad-request, provider-missing, generate-error, unknown-pet, unknown-image, unknown-animation]
+          enum:
+            [
+              bad-request,
+              provider-missing,
+              generate-error,
+              unknown-pet,
+              unknown-image,
+              unknown-animation,
+            ]
         message:
           type: string
           description: 人类可读的补充说明（可选）
@@ -1270,6 +1490,11 @@ components:
       type: object
       required: [text]
       properties:
+        emotionAnimation:
+          type: [string, "null"]
+          description: |
+            可选的已有动画名称。缺失时沿用原先 `events.whisper` 说话动画；
+            `null` 表示只显示文字、保留当前动画。素材映射缺失或无效时也按纯文字合理降级。
         text:
           type: string
           description: 要显示的文本（空文本会被消费端丢弃）
@@ -1411,6 +1636,19 @@ components:
             $ref: "#/components/schemas/PetEntry"
         notificationsEnabled:
           type: boolean
+        emotionEnabled:
+          type: boolean
+          default: true
+          description: |
+            连续情绪总开关（只认 main）。关闭后不注入情绪上下文或情绪动画，保留基本功能。
+            严格布尔；请求未传则保留用户文件中的已有值。
+        doNotDisturb:
+          type: boolean
+          default: false
+          description: |
+            勿扰总开关（只认 main）。暂停自动碎碎念、工作状态气泡与动画、系统通知、自动余额刷新。
+            手动聊天、手动碎碎念和手动余额查询仍可使用。已显示的说话气泡按原时长结束。
+            严格布尔；请求未传则保留用户文件中的已有值。
         whisperImageEnabled:
           type: boolean
         chatImageEnabled:
@@ -1442,6 +1680,14 @@ components:
         `workStatusTexts`、`physics`、`animations`、`eventsRefreshSec`、`animationWeights` 等。
         完整字段与默认值见包内 `assets/config.jsonc`（带注释，是默认值的唯一来源）。
       properties:
+        emotionEnabled:
+          type: boolean
+          default: true
+          description: 连续情绪总开关；只有 main 条目的值生效。
+        doNotDisturb:
+          type: boolean
+          default: false
+          description: 勿扰总开关；只有 main 条目的值生效。暂停自动来源，保留手动聊天、碎碎念与余额查询。
         id:
           type: string
         name:

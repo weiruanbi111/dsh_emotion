@@ -12,8 +12,21 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { createContext, runInContext } from 'node:vm';
 
-import { flattenCounters, readBalance, takeChanged, type PollState } from './state.ts';
+import {
+  chooseSayAnimation,
+  continueWorkStatusAnimation,
+  flattenCounters,
+  readBalance,
+  readSay,
+  takeChanged,
+  type PollState,
+} from './state.ts';
+import { isEventAnim, pick, pickSlot } from './pickers.ts';
+import { WORK_STATUS_INDEX } from './work-status.ts';
+import type { Animations } from './types.ts';
 
 /** 造一份 S：sections / pets 用简写（叶子值 = counter，data 用 data 字段给） */
 function makeState(
@@ -156,5 +169,215 @@ describe('readBalance —— 余额叶子 → 客户端视图', () => {
     assert.equal(readBalance({ counter: 1, data: 'nope' }), null);
     assert.equal(readBalance({ counter: 1, data: { ok: true, provider: 'p', shape: '未知' } }), null);
     assert.equal(readBalance({ counter: 1, data: { ok: true, provider: 'p', shape: 'money' } }), null, '缺 data 段');
+  });
+});
+
+const speechAnimations: Animations = {
+  idle: ['待机'],
+  turn: [],
+  drag: [],
+  clicks: ['点击'],
+  moves: { default: {}, actions: [] },
+  categories: [{ id: 'words', weight: 1, noMirror: true, actions: ['谢谢'] }],
+  events: { whisper: [['说话']], workStatus: ['完成'] },
+};
+
+describe('说话情绪动画契约', () => {
+  test('旧载荷不附字段，null 与配置名称保留，异常类型仅降级动画', () => {
+    assert.deepEqual(readSay({ counter: 1, data: { text: '你好' } }), { text: '你好', image: undefined });
+    for (const cue of [null, '完成', 1, {}, '']) {
+      const result = readSay({ counter: 1, data: { text: '你好', emotionAnimation: cue } });
+      assert.equal(result?.text, '你好');
+      assert.equal(result?.emotionAnimation, cue === '完成' ? cue : null);
+    }
+    assert.equal(readSay({ counter: 1, data: { emotionAnimation: '完成' } }), null);
+  });
+
+  test('旧载荷随机选 whisper，情绪名字只能从该宠物完整配置中选', () => {
+    assert.equal(chooseSayAnimation(speechAnimations, undefined), '说话');
+    for (const name of ['完成', '待机', '点击', '谢谢']) {
+      assert.equal(chooseSayAnimation(speechAnimations, name), name);
+    }
+    for (const name of [null, '未知素材', '../../other']) {
+      assert.equal(chooseSayAnimation(speechAnimations, name), null);
+    }
+  });
+
+  test('缺 whisper 或空候选档位时返回文字降级；显式情绪动画仍可用', () => {
+    const noWhisper = { ...speechAnimations, events: { workStatus: ['完成'] } };
+    assert.equal(chooseSayAnimation(noWhisper, undefined), null);
+    assert.equal(chooseSayAnimation(noWhisper, '完成'), '完成');
+    assert.equal(chooseSayAnimation({ ...noWhisper, events: { whisper: [[]] } }, undefined), null);
+  });
+});
+
+describe('工作动画续播只能依据真实当前档位', () => {
+  const pool = [['共同素材', '思考'], ['共同素材', '工作'], '整理', '等待', ['庆祝A', '庆祝B'], '失败'];
+
+  test('不续播回复借用的终态动画或其它工作档位', () => {
+    for (const name of ['庆祝A', '失败', '思考', '待机']) {
+      assert.equal(continueWorkStatusAnimation(pool, 'working', name), null);
+    }
+  });
+
+  test('同名素材属于多个档位时，只从真实档位选下一段', () => {
+    assert.deepEqual(continueWorkStatusAnimation(pool, 'working', '共同素材'), { name: '工作', once: true });
+    assert.deepEqual(continueWorkStatusAnimation(pool, 'thinking', '共同素材'), { name: '思考', once: true });
+    assert.deepEqual(continueWorkStatusAnimation(pool, 'waiting', '等待'), { name: '等待', once: false });
+  });
+
+  test('终态和空闲不继续工作循环', () => {
+    assert.equal(continueWorkStatusAnimation(pool, 'success', '庆祝A'), null);
+    assert.equal(continueWorkStatusAnimation(pool, 'error', '失败'), null);
+    assert.equal(continueWorkStatusAnimation(pool, null, '工作'), null);
+    assert.equal(continueWorkStatusAnimation([], 'working', '工作'), null);
+  });
+});
+
+describe('桌面实际脚本的说话消费', () => {
+  function harness(animations: Animations = speechAnimations) {
+    const calls = {
+      rendered: 0,
+      stopped: 0,
+      played: [] as string[],
+      switched: [] as { name: string; once: boolean }[],
+      timers: [] as (() => void)[],
+    };
+    const context = createContext({
+      S: {
+        chooseSayAnimation,
+        continueWorkStatusAnimation,
+        readSay,
+        isEventAnim,
+        pick,
+        pickSlot,
+        WORK_STATUS_INDEX,
+        whisperBubbleView: ({ text }: { text: string }) => [{ text }],
+        isNoMirrorAnimation: (categories: Animations['categories'], name: string) =>
+          categories.some((category) => category.noMirror && category.actions.includes(name)),
+      },
+      BUBBLE_DURATION_MS: 10000,
+      window: {
+        setTimeout: (fn: () => void) => calls.timers.push(fn),
+        clearTimeout: () => {},
+      },
+      console: { log: () => {} },
+      sprites: [],
+    });
+    runInContext(readFileSync(new URL('../../runtime/electron-helper/sprite.js', import.meta.url), 'utf8'), context);
+    runInContext(readFileSync(new URL('../../runtime/electron-helper/events.js', import.meta.url), 'utf8'), context);
+    const sprite = runInContext('Object.create(PetSprite.prototype)', context);
+    Object.assign(sprite, {
+      animations,
+      anim: '待机',
+      facing: 'right',
+      dragState: { active: false },
+      workState: null,
+      pet: { id: 'main' },
+      whisperTimer: null,
+      renderBubble: () => calls.rendered++,
+      stopMove: () => calls.stopped++,
+      switchTo: (name: string, once: boolean) => {
+        calls.switched.push({ name, once });
+        if (once) calls.played.push(name);
+      },
+    });
+    context.sprites.push(sprite);
+    return { context, sprite, calls };
+  }
+
+  test('消费真实 say 叶子，传递情绪素材，并修正含文字素材的镜像', () => {
+    const { context, sprite, calls } = harness();
+    runInContext("applySayLeaf('main', {counter: 1, data: {text: '收到夸奖', emotionAnimation: '谢谢'}})", context);
+    assert.deepEqual(calls.played, ['谢谢']);
+    assert.equal(sprite.facing, 'left');
+    assert.equal(sprite.whisperView[0].text, '收到夸奖');
+    assert.equal(calls.stopped, 1);
+    assert.equal(calls.timers.length, 1);
+    calls.timers[0]();
+    assert.equal(sprite.whisperOn, false);
+  });
+
+  test('缺池、null、不存在名称都展示文字且不打断当前动画', () => {
+    const noWhisper = { ...speechAnimations, events: {} };
+    for (const cue of [undefined, null, '未知素材']) {
+      const { sprite, calls } = harness(noWhisper);
+      sprite.showWhisper('依然显示', undefined, cue);
+      assert.equal(sprite.whisperOn, true);
+      assert.equal(sprite.whisperView[0].text, '依然显示');
+      assert.deepEqual(calls.played, []);
+      assert.equal(calls.stopped, 0);
+      assert.equal(calls.timers.length, 1);
+    }
+  });
+
+  test('旧载荷保留随机说话动画', () => {
+    const { sprite, calls } = harness();
+    sprite.showWhisper('旧消息');
+    assert.deepEqual(calls.played, ['说话']);
+  });
+
+  const workAnimations: Animations = {
+    ...speechAnimations,
+    events: { whisper: ['说话'], workStatus: [['思考A', '思考B'], '工作', '整理', '等待', ['庆祝A', '庆祝B'], '失败'] },
+  };
+
+  test('工作中聊天庆祝动画只播一次，ended 恢复真实工作档位', () => {
+    const { sprite, calls } = harness(workAnimations);
+    sprite.workState = 'working';
+    sprite.showWhisper('谢谢夸奖', undefined, '庆祝A');
+    sprite.handleEnded();
+    assert.deepEqual(calls.switched, [
+      { name: '庆祝A', once: true },
+      { name: '工作', once: false },
+    ]);
+    assert.equal(sprite.anim, '工作');
+    assert.equal(sprite.once, false);
+  });
+
+  test('工作中平静回复借用 idle，ended 仍恢复真实工作档位', () => {
+    const { sprite, calls } = harness(workAnimations);
+    sprite.workState = 'working';
+    sprite.showWhisper('慢慢来', undefined, '待机');
+    sprite.handleEnded();
+    assert.deepEqual(calls.switched, [
+      { name: '待机', once: true },
+      { name: '工作', once: false },
+    ]);
+    assert.equal(sprite.anim, '工作');
+    assert.equal(sprite.once, false);
+  });
+
+  test('真实工作多候选继续正常档内轮换', () => {
+    const rotating = {
+      ...workAnimations,
+      events: { ...workAnimations.events, workStatus: ['思考', ['工作A', '工作B']] },
+    };
+    const { sprite, calls } = harness(rotating);
+    sprite.workState = 'working';
+    sprite.anim = '工作A';
+    sprite.handleEnded();
+    assert.deepEqual(calls.switched, [{ name: '工作B', once: true }]);
+  });
+
+  test('其它工作档位被借用时不能错误轮换，必须恢复当前工作', () => {
+    const { sprite, calls } = harness(workAnimations);
+    sprite.workState = 'working';
+    sprite.anim = '思考A';
+    sprite.handleEnded();
+    assert.deepEqual(calls.switched, [{ name: '工作', once: false }]);
+  });
+
+  test('工作结束或空闲时庆祝只播一次，然后回 idle', () => {
+    for (const state of ['success', null]) {
+      const { sprite, calls } = harness(workAnimations);
+      sprite.workState = state;
+      sprite.showWhisper('完成啦', undefined, '庆祝A');
+      sprite.handleEnded();
+      assert.deepEqual(calls.switched, [
+        { name: '庆祝A', once: true },
+        { name: '待机', once: true },
+      ]);
+    }
   });
 });

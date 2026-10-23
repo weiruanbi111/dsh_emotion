@@ -70,7 +70,13 @@ import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { queryBalance } from './balance/index';
 import { generateWhisper } from './whisper';
+import { WhisperContentStore } from './whisper-content';
 import { generateChat, type ChatMemoryMessage } from './chat';
+import { EmotionStore } from './emotion';
+import { expressionPlan, type ExpressionPlan } from './emotion-expression';
+import { EmotionDiagnostics, localDiagnosticRequest, type DiagnosticInput } from './emotion-diagnostics';
+import { PET_BUILD } from '../build-info';
+import { isExplicitPraise, observedWorkEmotion, praiseEventId, proactivePeriodSec } from './emotion-policy';
 import { configuredModel } from './model-selection';
 import { limitPool, pickMeme, readMemePool } from './memes';
 import { decideBroadcast, normalizeBroadcastText } from './broadcast';
@@ -250,6 +256,41 @@ export function apply(ctx: any): void {
   // 用户数据根：配置与用户素材统一收敛于此（扩展包按 <插件id> 各自建目录）
   const dshHome = resolveDshHome();
   const userRoot = join(dshHome, 'dsh-pet');
+  const emotions = new EmotionStore(join(userRoot, 'emotion.json'));
+  const whisperContent = new WhisperContentStore(join(userRoot, 'whisper-content.json'));
+  const diagnostics = new EmotionDiagnostics();
+  const recordEvent = (
+    petId: string,
+    kind: Parameters<EmotionStore['apply']>[1],
+    eventId: string,
+    sessionId?: string,
+  ): boolean => {
+    const before = emotions.snapshot(petId);
+    diagnostics.observe(petId, before);
+    const result =
+      kind === 'task-completed' && sessionId !== undefined
+        ? emotions.applyHostCompletion(petId, eventId, sessionId)
+        : null;
+    const accepted = result === null ? emotions.apply(petId, kind, eventId) : result === 'accepted';
+    diagnostics.record(petId, {
+      category: 'event',
+      event:
+        kind === 'task-completed'
+          ? 'host-turn-completed'
+          : kind === 'task-failed'
+            ? 'host-execution-failed'
+            : kind === 'do-not-disturb'
+              ? 'quiet-mode'
+              : 'praise',
+      accepted,
+      reason:
+        result ??
+        (accepted ? 'accepted' : eventId.trim() === '' || eventId.length > 512 ? 'invalid-event' : 'duplicate-event'),
+      before,
+      after: emotions.snapshot(petId),
+    });
+    return accepted;
+  };
   // 用户主配置（可编辑层）与文件宠物目录；配置读取/合并统一走 readAllConfig（./config）。
   // 主配置是 **JSONC**（main-config.jsonc）——与包内默认 config.jsonc 同名同格式：
   // 「同步」写进去的就是带注释的原文，扩展名如实反映内容（旧版 main-config.json 只读回落 + 启动迁移）
@@ -289,6 +330,41 @@ export function apply(ctx: any): void {
   // 轮询统一状态（S）：前端 1s 轮询的**唯一**数据源（余额 / 工作状态 / 通知 / 宠物说话）。
   // 所有写入走 state.writeSection / writePet（由它统一更新 counter），见 ./state 的说明。
   const state = new PollStateStore();
+  const inFlightWhispers = new Set<string>();
+  // Incremented on policy/reset changes so a request started before quiet mode cannot publish afterwards.
+  let interactionRevision = 0;
+  let lastDoNotDisturb = false;
+  let lastEmotionEnabled = true;
+  const syncEmotionPolicy = (cfg: Record<string, Record<string, unknown>>): void => {
+    const quiet = cfg.main?.doNotDisturb === true;
+    const enabled = cfg.main?.emotionEnabled === true;
+    const leavingQuiet = lastDoNotDisturb && !quiet;
+    if (quiet !== lastDoNotDisturb || enabled !== lastEmotionEnabled) interactionRevision += 1;
+    if (quiet && !lastDoNotDisturb) {
+      if (enabled) {
+        for (const pet of flattenPetList(cfg)) {
+          recordEvent(String(pet.id), 'do-not-disturb', 'quiet:' + Date.now());
+        }
+      }
+      // Clear the plugin's current automatic work overlay immediately; explicit chat remains available.
+      state.writeSection('workStatus', { state: null, task: null });
+      state.writeSection('notify', null);
+      state.writeSection('balance', null);
+    }
+    lastDoNotDisturb = quiet;
+    lastEmotionEnabled = enabled;
+    if (leavingQuiet) {
+      publishedWork = '\u0000';
+      publishWorkStatus();
+    }
+  };
+  const quietMode = (): boolean => {
+    try {
+      return readAllConfig(configPaths).main?.doNotDisturb === true;
+    } catch {
+      return false;
+    }
+  };
   // 工作状态联动快照（/work-status 端点响应，浏览器 1s 轮询）：state=当前活动状态（null=空闲）、
   // task=当前任务详情、ts=最近变化时间（轮询侧检测变化用）。气泡文案不在此：浏览器读配置
   // events.workStatusTexts（host 不内置文案）。
@@ -304,6 +380,7 @@ export function apply(ctx: any): void {
   // data 里不再带 ts：「变了没有」已由叶子 counter 承担，少一个会漂移的第二信号。
   let publishedWork = '\u0000';
   const publishWorkStatus = (): void => {
+    if (quietMode()) return;
     const snap = workStatus.snapshot();
     const key = String(snap.state) + '\u0000' + String(snap.task);
     if (key === publishedWork) return;
@@ -317,6 +394,7 @@ export function apply(ctx: any): void {
   // **单槽**（后到覆盖先到）：同一秒来多条只弹最后一条。这是有意的取舍——1 秒内连弹多个系统通知
   // 本身没有意义（反而更烦），所以不再带 seq / 增量帧队列（改造前的 frames 数组机制已删）。
   const pushNotifyFrame = (frame: HostNotifyFrame): void => {
+    if (quietMode()) return;
     state.writeSection('notify', frame);
   }; /** 每会话 turn 级标志（goal 续跑轮判定；不参与展示，仅修正 turn/end 终局语义） */
   const turnFlags = new Map<string, WorkStatusTurnContext>();
@@ -405,7 +483,25 @@ export function apply(ctx: any): void {
    *  + 末尾追加一行**时间背景**（time-context.ts：日期/星期/时刻/时段/工作日或周末）：
    *    碎碎念与对话各自每次生成都会重新走这里，所以拿到的永远是**当前**时刻，不需要额外的刷新机制；
    *    非法 Date 时它为空串，此时整行不加（宁可没有时间信息，也不把 NaN 拼进提示词）。 */
-  const petSystemPrompt = (petId: string, cfg: Record<string, Record<string, unknown>>): string => {
+  const planExpression = (
+    petId: string,
+    cfg: Record<string, Record<string, unknown>>,
+    mode: 'chat' | 'whisper',
+    userText?: string,
+  ): ExpressionPlan =>
+    expressionPlan({
+      snapshot: emotions.snapshot(petId),
+      mode,
+      userText,
+      workState: workStatus.snapshot().state,
+      enabled: cfg.main?.emotionEnabled === true,
+      conf: findPetInstance(cfg, petId)?.conf ?? cfg.main ?? {},
+    });
+  const petSystemPrompt = (
+    petId: string,
+    cfg: Record<string, Record<string, unknown>>,
+    plan: ExpressionPlan,
+  ): string => {
     const found = findPetInstance(cfg, petId);
     const conf = found ? found.conf : (cfg.main ?? {});
     const prompt = typeof conf.whisperPrompt === 'string' ? conf.whisperPrompt : '';
@@ -413,7 +509,12 @@ export function apply(ctx: any): void {
     const nameLine = '你的名字是“' + name + '”。';
     const base = prompt ? prompt + '\n' + nameLine : nameLine;
     const time = timeContextOf(new Date());
-    return time ? base + '\n' + time : base;
+    syncEmotionPolicy(cfg);
+    const lines = ['[固定人设]\n' + base, time];
+    if (cfg.main?.emotionEnabled === true) lines.push(emotions.context(petId));
+    if (cfg.main?.doNotDisturb === true) lines.push('用户已开启勿扰；只回应这次明确请求，不催促互动。');
+    lines.push(plan.context);
+    return lines.filter(Boolean).join('\n');
   };
 
   /** 对话记忆轮数（1 轮 = 1 问 1 答）：所属条目/主条目的 chatMemoryRounds（合并器已填默认非负数字） */
@@ -429,29 +530,98 @@ export function apply(ctx: any): void {
    *  同一个气泡槽、同一批 events.whisper 动画），所以合并成同一个叶子；"周期内不重复"由
    *  调度侧的 lastWhisperAt 保证，不再需要一份 whisperCache（多端共享也由 S 天然保证）。
    *  配图（whisperImageEnabled 开启时）：从表情包池**随机抽 1 张**，把描述注入指令并随文本一起写。 */
-  const publishWhisper = async (petId: string): Promise<boolean> => {
+  const publishWhisper = async (petId: string, automatic = false, eventId = ''): Promise<boolean> => {
     const cfg = readAllConfig(configPaths);
+    syncEmotionPolicy(cfg);
     const found = findPetInstance(cfg, petId);
-    const conf = found ? found.conf : (cfg.main ?? {});
-    const entry = found ? found.entry : 'main';
-    const system = petSystemPrompt(petId, cfg);
-    // 配图：全局开关关闭 / 池为空 / 池内图片全缺失 → 纯文本（不报错，退化为原行为）
-    const meme = conf.whisperImageEnabled === true ? pickMeme(readMemePool(conf.memes, memeDirsFor(entry))) : undefined;
-    // 模型：条目配置的 whisperModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
-    const result = await generateWhisper(ctx, system, meme, configuredModel(conf, 'whisperModel'));
-    if (!result.ok) {
-      // 失败**不写 S**（与改造前一致：静默跳过 + console.warn，不伪造文案、不弹错误气泡）
-      console.warn(
-        '[dsh-pet] 碎碎念生成失败 pet=' +
-          petId +
-          ' reason=' +
-          result.reason +
-          (result.message ? ' ' + result.message : ''),
-      );
+    const skip = (reason: DiagnosticInput['reason']): false => {
+      diagnostics.record(petId, {
+        category: 'proactive',
+        event: automatic ? 'automatic-whisper' : 'manual-whisper',
+        accepted: false,
+        reason,
+        ...(automatic ? { strategy: 'quiet-companion' } : {}),
+        after: emotions.snapshot(petId),
+      });
       return false;
+    };
+    if (!found) return skip('unknown-pet');
+    if (inFlightWhispers.has(petId)) return skip('in-flight');
+    if (automatic) {
+      if (cfg.main?.doNotDisturb === true) return skip('quiet-mode');
+      if (found.pet.whisperEnabled !== true) return skip('pet-disabled');
+      const active = workStatus.snapshot().state;
+      if (active && active !== 'success' && active !== 'error') return skip('working');
+      const block = emotions.proactiveBlockReason(petId, eventId);
+      if (block) return skip(block);
+      if (!emotions.reserveProactive(petId, eventId)) return skip('cooldown');
+    } else {
+      emotions.noteInteraction(petId);
     }
-    state.writePet(petId, 'say', result.image ? { text: result.text, image: result.image } : { text: result.text });
-    return true;
+    const revision = interactionRevision;
+    inFlightWhispers.add(petId);
+    try {
+      const conf = found ? found.conf : (cfg.main ?? {});
+      const entry = found ? found.entry : 'main';
+      const plan = planExpression(petId, cfg, 'whisper');
+      const system = petSystemPrompt(petId, cfg, plan);
+      diagnostics.record(petId, {
+        category: 'expression',
+        event: automatic ? 'automatic-whisper' : 'manual-whisper',
+        accepted: true,
+        reason: 'planned',
+        strategy: plan.strategy,
+        animation: plan.animation,
+      });
+      // 配图：全局开关关闭 / 池为空 / 池内图片全缺失 → 纯文本（不报错，退化为原行为）
+      const meme =
+        conf.whisperImageEnabled === true ? pickMeme(readMemePool(conf.memes, memeDirsFor(entry))) : undefined;
+      // 模型：条目配置的 whisperModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
+      const result = await generateWhisper(ctx, system, meme, configuredModel(conf, 'whisperModel'));
+      if (!result.ok) {
+        // 失败**不写 S**（与改造前一致：静默跳过 + console.warn，不伪造文案、不弹错误气泡）
+        console.warn(
+          '[dsh-pet] 碎碎念生成失败 pet=' +
+            petId +
+            ' reason=' +
+            result.reason +
+            (result.message ? ' ' + result.message : ''),
+        );
+        return skip('generation-failed');
+      }
+      const current = readAllConfig(configPaths);
+      syncEmotionPolicy(current);
+      const currentPet = findPetInstance(current, petId);
+      if (!currentPet) return skip('pet-removed');
+      if (automatic) {
+        const active = workStatus.snapshot().state;
+        if (current.main?.doNotDisturb === true) return skip('quiet-mode');
+        if (revision !== interactionRevision) return skip('policy-changed');
+        if (currentPet.pet.whisperEnabled !== true) return skip('pet-disabled');
+        if (active && active !== 'success' && active !== 'error') return skip('working');
+        const content = whisperContent.check(petId, result.text);
+        if (!content.accepted) return skip(content.reason);
+      }
+      const finalPlan = planExpression(petId, current, 'whisper');
+      state.writePet(petId, 'say', {
+        text: result.text,
+        ...(result.image ? { image: result.image } : {}),
+        ...(current.main?.emotionEnabled === true ? { emotionAnimation: finalPlan.animation } : {}),
+      });
+      if (automatic) whisperContent.remember(petId, result.text);
+      diagnostics.record(petId, {
+        category: 'proactive',
+        event: automatic ? 'automatic-whisper' : 'manual-whisper',
+        accepted: true,
+        reason: 'published',
+        after: emotions.snapshot(petId),
+        strategy: finalPlan.strategy,
+        animation: finalPlan.animation,
+      });
+      return true;
+    } finally {
+      inFlightWhispers.delete(petId);
+    }
   };
 
   /** 与某只宠物对话：截取最近记忆 → 生成回复 → 写入记忆 → 把回复写进 S 的 pets.<id>.say。
@@ -460,14 +630,42 @@ export function apply(ctx: any): void {
   const chatWithPet = async (
     petId: string,
     text: string,
-  ): Promise<{ ok: true } | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string }> =>
+  ): Promise<
+    { ok: true } | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet'; message?: string }
+  > =>
     withMemoryLock(async () => {
       const cfg = readAllConfig(configPaths);
       const rounds = memoryRounds(petId, cfg);
       const found = findPetInstance(cfg, petId);
+      if (!found) return { ok: false as const, reason: 'unknown-pet' as const };
+      syncEmotionPolicy(cfg);
+      interactionRevision += 1; // A direct conversation supersedes an older automatic whisper.
+      emotions.noteInteraction(petId);
+      lastWhisperAt.set(petId, Date.now());
+      if (cfg.main?.emotionEnabled === true && isExplicitPraise(text)) {
+        recordEvent(petId, 'praise', praiseEventId(text, Date.now()));
+      } else {
+        diagnostics.record(petId, {
+          category: 'event',
+          event: 'user-message',
+          accepted: false,
+          reason: cfg.main?.emotionEnabled === true ? 'not-direct-praise' : 'feature-disabled',
+          before: emotions.snapshot(petId),
+          after: emotions.snapshot(petId),
+        });
+      }
       const conf = (found ?? { conf: cfg.main ?? {} }).conf;
       // 人设：所属条目的 whisperPrompt（合并器已填默认）+ 名字声明（与碎碎念同一拼装）
-      const system = petSystemPrompt(petId, cfg);
+      const plan = planExpression(petId, cfg, 'chat', text);
+      const system = petSystemPrompt(petId, cfg, plan);
+      diagnostics.record(petId, {
+        category: 'expression',
+        event: 'chat',
+        accepted: true,
+        reason: 'planned',
+        strategy: plan.strategy,
+        animation: plan.animation,
+      });
       // 配图：开关关闭 → 空池（指令与解析都不介入，与旧行为逐字一致）；目录链按所属条目取。
       // 张数上限（chatImageLimit，0 = 不限制）：整张清单每条消息都要附，截断后费用上限可控。
       const pool =
@@ -483,18 +681,39 @@ export function apply(ctx: any): void {
       const list = sliceMemoryRounds(entry.messages, rounds);
       // 模型：条目配置的 chatModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
       const generated = await generateChat(ctx, system, list, text, pool, configuredModel(conf, 'chatModel'));
-      if (!generated.ok) return generated;
+      if (!generated.ok) {
+        diagnostics.record(petId, {
+          category: 'expression',
+          event: 'chat',
+          accepted: false,
+          reason: 'generation-failed',
+          strategy: plan.strategy,
+          animation: plan.animation,
+        });
+        return generated;
+      }
       const now = Date.now();
       entry.messages.push({ role: 'user', content: text, ts: now });
       // 记忆只存正文（配图属展示层，不进上下文——否则下次请求会把标记当历史读回去）
       entry.messages.push({ role: 'assistant', content: generated.text, ts: now });
       await writeMemory(mem);
       // 回复写进 S（与碎碎念同一个叶子：前端本来就是同一条展示链路）
-      state.writePet(
-        petId,
-        'say',
-        generated.image ? { text: generated.text, image: generated.image } : { text: generated.text },
-      );
+      const current = readAllConfig(configPaths);
+      const finalPlan = planExpression(petId, current, 'chat', text);
+      state.writePet(petId, 'say', {
+        text: generated.text,
+        ...(generated.image ? { image: generated.image } : {}),
+        ...(current.main?.emotionEnabled === true ? { emotionAnimation: finalPlan.animation } : {}),
+      });
+      diagnostics.record(petId, {
+        category: 'expression',
+        event: 'chat',
+        accepted: true,
+        reason: 'published',
+        strategy: finalPlan.strategy,
+        animation: finalPlan.animation,
+        after: emotions.snapshot(petId),
+      });
       return { ok: true as const };
     });
 
@@ -552,6 +771,7 @@ export function apply(ctx: any): void {
   };
 
   const refreshBalance = async (manual = false): Promise<void> => {
+    if (!manual && quietMode()) return;
     const mark = <T>(v: T): T | (T & { manual: true }) => (manual ? { ...v, manual: true } : v);
     try {
       const sel = ctx.agentDefaultModel.currentSelection();
@@ -570,8 +790,9 @@ export function apply(ctx: any): void {
           return account.getBalance(accountClientMetadata());
         },
       );
-      state.writeSection('balance', mark(result));
+      if (manual || !quietMode()) state.writeSection('balance', mark(result));
     } catch (e) {
+      if (!manual && quietMode()) return;
       state.writeSection(
         'balance',
         mark({
@@ -796,9 +1017,65 @@ export function apply(ctx: any): void {
   /** 单次业务路由(WebServer 注册 → HTTP 落盘 / 桌面 Helper 管道 → scheme 应答,共用同一份实现):
    *  输入只需 rawUrl(/dsh-pet-7340/... + 查询) + method + body 文本;返回 RouteResult(JSON/文本/文件),
    *  消费方各自落盘——业务逻辑只有一份,两端天然一致(硬契约:浏览器/桌面行为严格对齐)。 */
-  const handlePetRoute = async (rawUrl: string, method: string, body?: string): Promise<RouteResult> => {
+  const handlePetRoute = async (
+    rawUrl: string,
+    method: string,
+    body?: string,
+    diagnosticAccess = false,
+  ): Promise<RouteResult> => {
     const url = new URL(rawUrl, 'http://localhost');
     const rest = decodeURIComponent(url.pathname.slice(ROUTE_PREFIX.length + 1));
+
+    if (rest === 'emotion' || rest === 'emotion/reset') {
+      if (method !== (rest === 'emotion' ? 'GET' : 'POST')) {
+        return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      }
+      const withDiagnostics = rest === 'emotion' && url.searchParams.get('diagnostics') === '1';
+      if (withDiagnostics && !diagnosticAccess) {
+        return {
+          kind: 'json',
+          status: 403,
+          obj: { ok: false, reason: 'local-diagnostics-only' },
+          headers: { 'Cache-Control': 'no-store' },
+        };
+      }
+      const cfg = readAllConfig(configPaths);
+      syncEmotionPolicy(cfg);
+      const petId = url.searchParams.get('pet');
+      if ((petId !== null && !findPetInstance(cfg, petId)) || (rest === 'emotion' && !petId)) {
+        return { kind: 'json', status: 400, obj: { ok: false, reason: 'unknown-pet' } };
+      }
+      if (rest === 'emotion/reset') {
+        const resetIds = petId ? [petId] : flattenPetList(cfg).map((p) => String(p.id));
+        const before = new Map(resetIds.map((id) => [id, emotions.snapshot(id)]));
+        emotions.reset(petId ?? undefined);
+        for (const id of resetIds)
+          diagnostics.record(id, {
+            category: 'lifecycle',
+            event: 'reset',
+            accepted: true,
+            reason: 'reset',
+            before: before.get(id),
+            after: emotions.snapshot(id),
+          });
+        interactionRevision += 1;
+        return { kind: 'json', status: 200, obj: { ok: true } };
+      }
+      if (withDiagnostics) diagnostics.observe(petId!, emotions.snapshot(petId!));
+      return {
+        kind: 'json',
+        status: 200,
+        obj: {
+          ok: true,
+          enabled: cfg.main?.emotionEnabled === true,
+          doNotDisturb: cfg.main?.doNotDisturb === true,
+          state: emotions.snapshot(petId!),
+          build: PET_BUILD,
+          ...(withDiagnostics ? { diagnostics: diagnostics.read(petId!) } : {}),
+        },
+        headers: { 'Cache-Control': 'no-store' },
+      };
+    }
 
     // 成品配置：/dsh-pet-7340/config（GET 读取合并成品 / PUT 保存用户层 / POST 同步内置默认）
     if (rest === 'config') {
@@ -843,6 +1120,7 @@ export function apply(ctx: any): void {
           }
           await mkdir(userRoot, { recursive: true });
           await writeFile(userConfigPath, JSON.stringify(clean, null, 2), 'utf8');
+          syncEmotionPolicy(readAllConfig(configPaths));
           void syncDesktop(); // display/size 等可能变化：重解析桌面宠物并重启 Helper（异步，不阻塞保存响应）
           // 响应体 = 保存后的**成品聚合**（与 GET /config 同一份，字段已填满）：
           // 设置页把它直接交给容器的 flattenConfigPets 拍平渲染——客户端的条目级字段
@@ -858,6 +1136,7 @@ export function apply(ctx: any): void {
         // 不必再自己从包内复制一份（见 config.ts 的 syncUserConfigFromDefault）。
         try {
           syncUserConfigFromDefault(configPaths);
+          syncEmotionPolicy(readAllConfig(configPaths));
         } catch (e) {
           // 默认文件缺失 / 用户目录不可写：显式 500，绝不静默留下半个配置文件
           return { kind: 'json', status: 500, obj: { error: e instanceof Error ? e.message : String(e) } };
@@ -1214,7 +1493,22 @@ export function apply(ctx: any): void {
         handler: async (req: IncomingMessage, res: ServerResponse) => {
           try {
             const body = req.method === 'PUT' || req.method === 'POST' ? await readBody(req) : undefined;
-            const result = await handlePetRoute(req.url ?? '/', req.method ?? 'GET', body);
+            const result = await handlePetRoute(
+              req.url ?? '/',
+              req.method ?? 'GET',
+              body,
+              localDiagnosticRequest(req, () => {
+                // Reuse DSH authentication; never inspect, copy or log its cookies/tokens.
+                try {
+                  return (
+                    typeof ctx.connection?.requestRejection === 'function' &&
+                    ctx.connection.requestRejection(req) === undefined
+                  );
+                } catch {
+                  return false;
+                }
+              }),
+            );
             if (result.kind === 'json') sendJson(res, result.status, result.obj, result.headers);
             else if (result.kind === 'text') sendText(res, result.status, result.body);
             else sendFile(res, result.file, result.contentType); // 非 async：流在 open 后自己 pipe，错误内部收口
@@ -1288,6 +1582,44 @@ export function apply(ctx: any): void {
         event as { type?: string; data?: Record<string, unknown> & { reason?: { kind?: string } } },
         turnFlags.get(sessionId),
       );
+      const emotionEvent = observedWorkEmotion(event as Parameters<typeof observedWorkEmotion>[0], next);
+      if (type === 'turn/end') {
+        try {
+          const cfg = readAllConfig(configPaths);
+          syncEmotionPolicy(cfg);
+          for (const pet of flattenPetList(cfg)) {
+            const reason =
+              cfg.main?.emotionEnabled !== true
+                ? 'feature-disabled'
+                : sessionId === 'unknown'
+                  ? 'missing-session'
+                  : !Number.isSafeInteger((event as { seq?: unknown }).seq) ||
+                      Number((event as { seq?: unknown }).seq) <= 0
+                    ? 'invalid-event'
+                    : !emotionEvent
+                      ? 'unobserved-event'
+                      : null;
+            if (reason) {
+              diagnostics.record(String(pet.id), {
+                category: 'event',
+                event: 'host-event',
+                accepted: false,
+                reason,
+                after: emotions.snapshot(String(pet.id)),
+              });
+            } else if (emotionEvent) {
+              recordEvent(
+                String(pet.id),
+                emotionEvent,
+                'work:' + sessionId + ':' + String((event as { seq: number }).seq),
+                sessionId,
+              );
+            }
+          }
+        } catch {
+          // A broken configuration must not break the host's session event listener.
+        }
+      }
       if (!next) {
         // turn/end 的 null（aborted / 未知 kind）＝该会话回合已结束：清掉会话状态，让展示回到空闲或
         // 落到其他活跃会话，防止回合被打断后永久卡在上一档；其他事件的 null 是"不关心"，忽略。
@@ -1413,17 +1745,40 @@ export function apply(ctx: any): void {
       let next = 300;
       try {
         const cfg = readAllConfig(configPaths);
+        syncEmotionPolicy(cfg);
         const now = Date.now();
         let min = Infinity;
         for (const pet of flattenPetList(cfg)) {
           const petId = String(pet.id ?? '');
-          if (!petId || pet.whisperEnabled !== true) continue;
-          const sec = whisperPeriodSec(cfg, petId);
+          if (!petId) continue;
+          if (pet.whisperEnabled !== true) {
+            diagnostics.record(petId, {
+              category: 'proactive',
+              event: 'automatic-whisper',
+              accepted: false,
+              reason: 'pet-disabled',
+              strategy: 'quiet-companion',
+            });
+            continue;
+          }
+          const sec = proactivePeriodSec(
+            whisperPeriodSec(cfg, petId),
+            cfg.main?.emotionEnabled === true ? emotions.snapshot(petId).label : 'calm',
+          );
           min = Math.min(min, sec);
-          if (now - (lastWhisperAt.get(petId) ?? 0) < sec * 1000) continue;
+          if (now - (lastWhisperAt.get(petId) ?? 0) < sec * 1000) {
+            diagnostics.record(petId, {
+              category: 'proactive',
+              event: 'automatic-whisper',
+              accepted: false,
+              reason: 'period-not-due',
+              strategy: 'quiet-companion',
+            });
+            continue;
+          }
           lastWhisperAt.set(petId, now);
           // 不 await：生成要几秒，别把调度拍拖住（每只宠物独立生成，互不阻塞）
-          void publishWhisper(petId).catch(() => {});
+          void publishWhisper(petId, true, 'scheduled:' + Math.floor(now / (sec * 1000))).catch(() => {});
         }
         if (Number.isFinite(min)) next = min;
       } catch {

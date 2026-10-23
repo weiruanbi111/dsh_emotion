@@ -470,24 +470,19 @@ class PetSprite {
     // 事件动画播完：回 idle（与 drag/clicks 同分支，不进随机链）；气泡由定时器自动消失，与动画解耦
     const isEvent = S.isEventAnim(animations.events, this.anim);
     if (isEvent) {
-      // 工作状态多候选档位：播完一段自动轮换到下一候选（排除当前段，避免连抽），继续循环——
-      // 长时间状态不单段重复（与浏览器 ended 护栏共用同一决策 nextWorkStatusAnim）。
-      // 仅非终态档位轮换；终态（success/error）播完一次即结束，绝不轮换续播。单候选档位由
-      // loop 无限循环（不触发 ended，不会走到这里）。
-      const nonTerminal = this.workState && this.workState !== 'success' && this.workState !== 'error';
-      const nextWork = nonTerminal ? S.nextWorkStatusAnim(animations.events?.workStatus ?? [], this.anim) : null;
-      if (nextWork !== null) {
-        console.log(
-          '[dsh-pet] ' +
-            new Date().toTimeString().slice(0, 8) +
-            ' pet=' +
-            this.pet.id +
-            ' workStatus 档内轮换: ' +
-            this.anim +
-            ' -> ' +
-            nextWork,
-        );
-        this.playOnce(nextWork); // 继续播一遍（once=true）→ ended 再轮换
+      // 只续播真实当前工作档位；聊天借用的终态素材不能进入工作循环。
+      const continuation = S.continueWorkStatusAnimation(
+        animations.events?.workStatus ?? [],
+        this.workState,
+        this.anim,
+      );
+      if (continuation) {
+        if (continuation.once) this.playOnce(continuation.name);
+        else {
+          this.anim = continuation.name;
+          this.once = false;
+          this.switchTo(continuation.name, false);
+        }
         return;
       }
       // 非 workStatus 事件动画（余额/碎碎念）播完：workStatus 仍非终态 → 立即恢复档位循环动画，
@@ -506,6 +501,8 @@ class PetSprite {
       if (animations.idle.length) this.playOnce(S.pick(animations.idle, this.anim));
       return;
     }
+    // 平静回复可能借用 idle/普通动作；结束后也须恢复真实工作档位。
+    if (this.resumeWorkStatusAnim()) return;
     this.playIdle();
   }
 
@@ -526,7 +523,11 @@ class PetSprite {
     const rotating = Array.isArray(slot) && slot.length > 1;
     if (rotating)
       this.playOnce(name); // 多候选：播完由 handleEnded 轮换
-    else this.switchTo(name, false); // 单候选：无限循环
+    else {
+      this.anim = name;
+      this.once = false;
+      this.switchTo(name, false); // 单候选：无限循环
+    }
     return true;
   }
 
@@ -1251,6 +1252,13 @@ class PetSprite {
       return;
     }
     this.playOnce(leaf.anim);
+  }
+
+  // 说话动画使用已校验的本宠物配置名；与网页一致处理含文字素材的镜像。
+  playSayAnimation(name) {
+    if (S.isNoMirrorAnimation(this.animations.categories, name) && this.facing === 'right') this.facing = 'left';
+    this.stopMove();
+    this.playOnce(name);
   }
 
   closeMenu() {

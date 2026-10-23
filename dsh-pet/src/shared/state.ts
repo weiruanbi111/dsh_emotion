@@ -8,7 +8,9 @@
 // 路径（'sections.balance' / 'pets.<id>.say'）只当**不透明键**用，绝不解析——
 // 宠物 id 允许含点号，解析出来必然出错。
 import { toBalanceState, type BalanceState } from './balance';
-import { toWorkStatus, type WorkStatusSnapshot } from './work-status';
+import { toWorkStatus, WORK_STATUS_INDEX, type WorkStatusSnapshot, type WorkStatusState } from './work-status';
+import { pick, pickSlot, isEventAnim, slotIncludes } from './pickers';
+import type { Animations, EventSlot } from './types';
 
 /** 一个叶子：计数器 + 载荷（data 为 null = 还没有数据，消费端跳过） */
 export interface StateLeaf {
@@ -114,15 +116,63 @@ export function readBalance(leaf: StateLeaf): { state: BalanceState; manual: boo
 }
 
 /**
- * 类型收窄：宠物说话叶子 → `{ text, image? }`（形状非法 / 空文本 → null，消费端跳过这一拍）。
+ * 类型收窄：宠物说话叶子（形状非法 / 空文本 → null，消费端跳过这一拍）。
  * 碎碎念、命令气泡、对话回复共用这一个叶子——前端本来就是同一条展示链路
  * （同一个 triggerWhisper、同一个气泡槽、同一批 events.whisper 动画）。
  */
-export function readSay(leaf: StateLeaf): { text: string; image?: string } | null {
+export interface SayPayload {
+  text: string;
+  image?: string;
+  /** 缺省沿用随机说话动画；null 仅显示气泡；名字须在本宠物配置内。 */
+  emotionAnimation?: string | null;
+}
+
+export function readSay(leaf: StateLeaf): SayPayload | null {
   if (!leaf.data || typeof leaf.data !== 'object') return null;
-  const d = leaf.data as { text?: unknown; image?: unknown };
+  const d = leaf.data as { text?: unknown; image?: unknown; emotionAnimation?: unknown };
   if (typeof d.text !== 'string' || !d.text) return null;
-  return { text: d.text, image: typeof d.image === 'string' ? d.image : undefined };
+  const said: SayPayload = { text: d.text, image: typeof d.image === 'string' ? d.image : undefined };
+  if (d.emotionAnimation !== undefined) {
+    said.emotionAnimation = typeof d.emotionAnimation === 'string' && d.emotionAnimation ? d.emotionAnimation : null;
+  }
+  return said;
+}
+
+/** 双端同一动画决策；没有素材映射时保留原动画，仍然显示文字。 */
+export function chooseSayAnimation(
+  animations: Animations,
+  cue: SayPayload['emotionAnimation'],
+  current?: string,
+): string | null {
+  if (cue === undefined) {
+    // 空候选档位不能让文字丢失，旧客户端不附 cue 时仍沿用原先随机说话行为。
+    const pool = (animations.events?.whisper ?? []).filter((slot) =>
+      typeof slot === 'string' ? !!slot : slot.length > 0,
+    );
+    return pool.length ? pickSlot(pick(pool, current), current) : null;
+  }
+  if (typeof cue !== 'string' || !cue) return null;
+  const configured =
+    animations.idle.includes(cue) ||
+    animations.turn.includes(cue) ||
+    animations.drag.includes(cue) ||
+    animations.clicks.includes(cue) ||
+    animations.moves.actions.some((move) => move.name === cue) ||
+    animations.categories.some((category) => category.actions.includes(cue)) ||
+    isEventAnim(animations.events, cue);
+  return configured ? cue : null;
+}
+
+/** 仅真实当前工作档位可续播；回复借用的庆祝/失落动画播一遍后必须恢复真实状态。 */
+export function continueWorkStatusAnimation(
+  pool: readonly EventSlot[],
+  state: WorkStatusState | null | undefined,
+  current: string,
+): { name: string; once: boolean } | null {
+  if (!state || state === 'success' || state === 'error') return null;
+  const slot = pool[WORK_STATUS_INDEX[state]];
+  if (slot === undefined || !slotIncludes(slot, current)) return null;
+  return { name: pickSlot(slot, current), once: Array.isArray(slot) && slot.length > 1 };
 }
 
 /**
